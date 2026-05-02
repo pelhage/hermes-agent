@@ -173,3 +173,4 @@ not-iterable = "ignore"
 exclude = ["*"]
 
 [tool.uv]
+exclude-newer = "7 days"
