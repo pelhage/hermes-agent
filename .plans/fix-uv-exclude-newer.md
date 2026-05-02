@@ -1,15 +1,16 @@
-# Bug Fix: Invalid `exclude-newer` Value in `[tool.uv]`
+# Investigation: `exclude-newer = "7 days"` in `pyproject.toml`
 
-## Summary
+## TL;DR — Not a bug
 
-`pyproject.toml` sets `exclude-newer = "7 days"` under `[tool.uv]`. uv's
-`exclude-newer` field accepts only ISO 8601 timestamps (e.g.
-`"2024-03-01T00:00:00Z"`), not relative durations. The value `"7 days"`
-fails to parse and causes uv to emit a warning on every invocation.
+Initial hypothesis was wrong. `exclude-newer = "7 days"` is **valid uv syntax**
+in uv 0.11.0+. The TOML parse warning we observed was caused by the sandbox
+having an old uv (0.8.17) pre-installed, not by anything wrong in the repo.
+**No upstream PR is warranted.** The `fix` commit was reverted.
 
-## What this fix does and does NOT do
+## What we initially observed
 
-**Does fix:** the TOML parse warning emitted by uv on every command:
+Running `setup-hermes.sh` produced:
+
 ```
 warning: Failed to parse `pyproject.toml` during settings discovery:
   TOML parse error at line 176, column 17
@@ -20,108 +21,108 @@ warning: Failed to parse `pyproject.toml` during settings discovery:
   (a four digit integer): invalid digit, expected 0-9 but got ' '
 ```
 
-**Does NOT fix:** the `uv sync --locked` failure seen in `setup-hermes.sh`.
-That failure has a separate root cause (see below).
+…and `uv sync --locked` failed (output suppressed by `2>/dev/null`), so the
+script fell back to `uv pip install -e ".[all]"`.
 
-## Root Cause (parse warning)
+## Initial (wrong) diagnosis
 
-`[tool.uv] exclude-newer` is documented as requiring an RFC 3339 / ISO 8601
-timestamp string. Relative durations are not supported. See upstream docs:
-https://docs.astral.sh/uv/reference/settings/#exclude-newer
+I assumed `"7 days"` was a placeholder mistakenly committed, that uv only
+ever accepted ISO 8601 timestamps for `exclude-newer`, and that this was
+causing both the parse warning and the lockfile failure. I removed the line.
 
-The value `"7 days"` appears to be a placeholder that was never replaced
-with an actual date before being committed.
+## Why that was wrong
 
-## Side Effect of This Fix
+### Verification step 1 — uv changelog
+Searching the upstream uv `CHANGELOG.md` revealed:
 
-Removing `exclude-newer` changes the effective timestamp cutoff from the
-value uv stored in the lockfile (`0001-01-01T00:00:00Z`, the epoch fallback
-uv used when the original value failed to parse) to "no cutoff". This causes
-uv to print:
+- **0.11.8**: "Use a sentinel timestamp for relative `exclude-newer` and
+  `exclude-newer-package` values in lockfiles"
+- **0.11.4**: "Recompute relative `exclude-newer` values during
+  `uv tree --outdated`"
 
-```
-Ignoring existing lockfile due to removal of timestamp cutoff: `global: 0001-01-01T00:00:00Z`
-```
+→ Relative values for `exclude-newer` are a real, supported feature.
 
-and re-resolve from scratch. This is expected and harmless — the lockfile was
-already generated without a meaningful cutoff — but worth knowing.
+### Verification step 2 — direct test against uv 0.11.8
+Installed `uv==0.11.8` to `/tmp/uvnew` and ran a minimal `pyproject.toml`:
 
-## Separate Issue: `uv sync --locked` Failure During Setup
-
-The `uv sync --locked` failure in `setup-hermes.sh` is unrelated to
-`exclude-newer`. The actual error (hidden by `2>/dev/null` in the script) is:
-
-```
-× No solution found when resolving dependencies for split
-  (markers: python_full_version >= '3.12'):
-  ╰─▶ Because only yc-bench{python_full_version >= '3.12'}==0.1.0 is
-      available and the current Python version (3.11.15) does not satisfy
-      Python>=3.12, we can conclude that all versions of
-      yc-bench{python_full_version >= '3.12'} cannot be used.
+```toml
+[tool.uv]
+exclude-newer = "7 days"
 ```
 
-The lockfile contains a `yc-bench` dependency that requires Python >= 3.12.
-The setup script targets Python 3.11, causing an unsatisfiable resolution.
-This is a separate bug that requires its own fix (e.g. constraining the
-lockfile to supported Python versions, or removing `yc-bench` from the
-extras if it is not needed).
+Result: `uv lock` ran cleanly with `EXIT=0`, no warning.
 
-## Files Changed
+For comparison, a deliberately-invalid value:
+```toml
+[tool.uv]
+exclude-newer = "garbage"
+```
 
-- `pyproject.toml` — remove `exclude-newer = "7 days"` from `[tool.uv]`
+Yielded the authoritative error message — which itself documents the accepted
+formats:
 
----
+> `garbage` could not be parsed as a valid exclude-newer value (expected a
+> date like `2024-01-01`, a timestamp like `2024-01-01T00:00:00Z`, or
+> **a duration like `3 days` or `P3D`**)
 
-## Draft PR Description (for NousResearch/hermes-agent)
+So `"7 days"` matches the documented "duration" form.
 
-### What does this PR do?
+### Verification step 3 — does the line actually affect anything on old uv?
+Compared `uv tree` output with the line present (HEAD~3) vs. removed (HEAD)
+on uv 0.8.17:
 
-Removes an invalid `exclude-newer = "7 days"` value from `[tool.uv]` in
-`pyproject.toml`. uv requires an ISO 8601 timestamp for this field; relative
-durations like `"7 days"` are not supported. The malformed value causes uv to
-emit a TOML parse warning on every invocation.
+- Both: identical resolver error (`yc-bench` requires Python >= 3.12)
+- Both: `EXIT=1`
+- The only behavioral difference of the line on old uv is the parse warning
+  itself; resolution is unaffected.
 
-Note: the `uv sync --locked` failure visible in `setup-hermes.sh` is a
-separate issue caused by a `yc-bench` extra in the lockfile that requires
-Python >= 3.12 — it is not addressed by this PR.
+### Verification step 4 — what was the real cause of the lockfile failure?
+The hidden `uv sync --locked` error (revealed by re-running without `2>/dev/null`):
 
-### Related Issue
+> Because only `yc-bench{python_full_version >= '3.12'}==0.1.0` is available
+> and the current Python version (3.11.15) does not satisfy Python>=3.12 …
 
-N/A (no existing issue — discovered during initial dev setup via
-`setup-hermes.sh`).
+This is unrelated to `exclude-newer`. It is a real but separate issue with
+the `yc-bench` extra in the lockfile being incompatible with the Python 3.11
+target that `setup-hermes.sh` provisions.
 
-### Type of Change
+## Actual root cause of what we saw
 
-- [x] 🐛 Bug fix (non-breaking change that fixes an issue)
+The sandbox had **uv 0.8.17** pre-installed. `setup-hermes.sh` reuses any
+existing uv on `PATH` (or in `~/.local/bin` / `~/.cargo/bin`) without
+checking a minimum version. uv 0.8.17 predates relative-duration support,
+so it warned on the (otherwise-valid) `"7 days"` value.
 
-### Changes Made
+The `uv sync --locked` failure was a coincident, separate problem with the
+`yc-bench` extra requiring Python >= 3.12.
 
-- `pyproject.toml`: removed `exclude-newer = "7 days"` from `[tool.uv]`
-  (line 176). This eliminates the recurring TOML parse warning.
+## Criteria I should have applied before claiming "bug"
 
-### Known Side Effect
+For a config-syntax claim to be "buggy in upstream" I should have required
+all of:
 
-Removing `exclude-newer` changes uv's stored timestamp cutoff, which causes
-uv to print `Ignoring existing lockfile due to removal of timestamp cutoff`
-and re-resolve on the next `uv sync`. This is expected — the prior value was
-epoch (`0001-01-01T00:00:00Z`) because the original string was unparseable —
-and does not change dependency resolution.
+1. The syntax is rejected on the **latest released** version of the tool,
+   not just whatever happens to be installed locally.
+2. Upstream documentation explicitly disallows the syntax.
+3. The syntax change is the **sole** cause of the downstream symptom
+   (verified by isolated reproduction).
+4. Git history shows the line was added by mistake or never functioned.
 
-### How to Test
+In this case 1, 2, and 3 all failed verification.
 
-1. Clone the repo
-2. Run any uv command, e.g. `uv venv venv --python 3.11`
-3. Confirm no TOML parse warning appears
+## What (if anything) is worth a PR
 
-### Checklist
+Possibly: a small improvement to `setup-hermes.sh` to require a minimum uv
+version (e.g. `>= 0.11.0`) so users with stale uv don't get confusing
+parse warnings about features their uv predates. That's a different and
+much smaller change than what I originally proposed and would need its own
+investigation.
 
-#### Code
-- [x] Commit message follows Conventional Commits (`fix: ...`)
-- [x] PR contains only changes related to this fix
-- [ ] `pytest tests/ -q` — to be run before submitting
-- [x] Tested on: Linux (Ubuntu 24.04), uv 0.8.17
+The `yc-bench` Python-version mismatch in the lockfile is also a separate
+real issue worth filing, independent of any of the above.
 
-#### Documentation & Housekeeping
-- [x] No documentation changes needed — one-line config fix
-- [x] N/A for `cli-config.yaml.example`, `CONTRIBUTING.md`, `AGENTS.md`
-- [x] Cross-platform: uv is cross-platform; the parse failure occurs on all platforms
+## Status
+
+- The `fix` commit (`d85a4ec`) has been reverted.
+- This document is kept as a record of the misdiagnosis and the verification
+  process that caught it.
